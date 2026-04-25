@@ -1,13 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 import express from 'express';
+import multer from 'multer';
 import { config } from './config.js';
-import { chatStream, chatComplete, ChatMessage, TOOLS, getSystemPrompt } from './llm.js';
-import { startFeishuPolling, setBroadcast } from './feishu.js';
+import { chatStream, ChatMessage, TOOLS, getSystemPrompt } from './llm.js';
+import { startFeishuPolling, setBroadcast, readPdfText, readDocxText, readTextFile } from './feishu.js';
 import { webSearch, formatSearchResults } from './search.js';
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
+
+// ─── 文件上传 ───
+export const WEB_UPLOAD_DIR = path.resolve(process.cwd(), 'web_uploads');
+if (!fs.existsSync(WEB_UPLOAD_DIR)) fs.mkdirSync(WEB_UPLOAD_DIR, { recursive: true });
+const upload = multer({ dest: WEB_UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } });
 
 // ========== SSE 广播 ==========
 const sseClients: express.Response[] = [];
@@ -53,19 +59,79 @@ app.get('/api/events', (req, res) => {
   });
 });
 
+// ─── 文件上传接口 ───
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+  const file = req.file;
+  if (!file) {
+    res.status(400).json({ error: '未选择文件' });
+    return;
+  }
+
+  const ext = path.extname(file.originalname).toLowerCase();
+  const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp']);
+
+  try {
+    // 图片 → 读取为 base64
+    if (imageExts.has(ext)) {
+      const data = fs.readFileSync(file.path);
+      const base64 = data.toString('base64');
+      const mime = ext === '.jpg' ? 'jpeg' : ext.slice(1);
+      res.json({ type: 'image', data: `data:image/${mime};base64,${base64}`, fileName: file.originalname });
+      return;
+    }
+
+    // PDF
+    if (ext === '.pdf') {
+      const text = await readPdfText(file.path);
+      if (text) {
+        res.json({ type: 'text', data: `📄 上传了 PDF: ${file.originalname}\n\n\`\`\`\n${text}\n\`\`\``, fileName: file.originalname });
+      } else {
+        res.json({ type: 'text', data: `📄 上传了 PDF: ${file.originalname}（未提取到文字内容）`, fileName: file.originalname });
+      }
+      return;
+    }
+
+    // DOCX
+    if (ext === '.docx') {
+      const text = await readDocxText(file.path);
+      if (text) {
+        res.json({ type: 'text', data: `📄 上传了 DOCX: ${file.originalname}\n\n\`\`\`\n${text}\n\`\`\``, fileName: file.originalname });
+      } else {
+        res.json({ type: 'text', data: `📄 上传了 DOCX: ${file.originalname}（未提取到文字内容）`, fileName: file.originalname });
+      }
+      return;
+    }
+
+    // 文本文件
+    const textContent = readTextFile(file.path);
+    if (textContent) {
+      res.json({ type: 'text', data: `📄 上传了 ${file.originalname}\n\n\`\`\`\n${textContent}\n\`\`\``, fileName: file.originalname });
+      return;
+    }
+
+    // 其他
+    res.json({ type: 'text', data: `📁 上传了文件: ${file.originalname}（小 Hermes 暂不支持读取该格式）`, fileName: file.originalname });
+  } catch (err) {
+    console.error('[上传] 处理失败:', err);
+    res.status(500).json({ error: '处理文件失败' });
+  }
+});
+
 // ========== Web UI API ==========
 
-// 流式聊天接口
+// 流式聊天接口（单次流式调用模式 - 和 Hermes Agent 一致）
 app.post('/api/chat', async (req, res) => {
   const t0 = Date.now();
   const { messages, model }: { messages: ChatMessage[]; model?: string } = req.body;
+  const reqId = Date.now().toString(36);
+  console.log(`[API #${reqId}] 收到 /api/chat 请求, messages数: ${messages?.length || 0}, model: ${model}`);
 
   if (!messages || !Array.isArray(messages)) {
     res.status(400).json({ error: 'messages is required' });
     return;
   }
 
-  // 注入系统提示词，让模型知道自己是谁
+  // 注入系统提示词
   const systemMsg: ChatMessage = { role: 'system', content: getSystemPrompt() };
   const msgs: ChatMessage[] = [systemMsg, ...messages];
 
@@ -78,75 +144,77 @@ app.post('/api/chat', async (req, res) => {
   try {
     const hasTools = config.tavily.apiKey ? TOOLS : undefined;
 
-    // Function Calling: 让模型自己决定是否需要搜索
-    const firstResult = await chatComplete(msgs, model, hasTools);
+    // 单次流式调用（带工具定义）
+    // 模式：流式调用 → 没有 tool_calls → 一次搞定 ✓
+    //       流式调用 → 有 tool_calls（要搜索）→ 执行搜索 → 再流式生成回答
+    let chunkCount = 0;
+    let contentCount = 0;
+    let thinkingCount = 0;
+    let replyText = '';
+    let toolCallsFromStream: any[] = [];
 
-      if (firstResult.tool_calls?.length) {
-      // 模型决定需要搜索
-      console.log(`[API] 模型决定需要搜索，工具调用数: ${firstResult.tool_calls.length}`);
-      for (const tc of firstResult.tool_calls) {
-        if (tc.function.name === 'web_search') {
+    for await (const chunk of chatStream(msgs, model, hasTools)) {
+      chunkCount++;
+      if (chunk.startsWith('__THINKING__')) {
+        thinkingCount++;
+        const thinkingData = chunk.slice(12);
+        res.write(`data: ${JSON.stringify({ thinking: thinkingData })}\n\n`);
+      } else if (chunk.startsWith('__TOOL_CALL__')) {
+        // 模型请求工具调用 - 收集起来流结束后执行
+        try {
+          toolCallsFromStream = JSON.parse(chunk.slice(12));
+          console.log(`[API #${reqId}] 流中检测到工具调用: ${toolCallsFromStream.length} 个`);
+        } catch { }
+      } else if (chunk.startsWith('__STATS__')) {
+        const stats = chunk.slice(9);
+        res.write(`data: ${JSON.stringify({ content: chunk })}\n\n`);
+      } else {
+        contentCount++;
+        replyText += chunk;
+        res.write(`data: ${JSON.stringify({ content: chunk })}\n\n`);
+      }
+    }
+
+    console.log(`[API #${reqId}] 首次流式结束: content=${contentCount}, thinking=${thinkingCount}, toolCalls=${toolCallsFromStream.length}`);
+
+    if (toolCallsFromStream.length > 0) {
+      // 执行工具调用
+      const searchMessages: ChatMessage[] = [...msgs];
+      for (const tc of toolCallsFromStream) {
+        if (tc.function?.name === 'web_search') {
           const args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
-          console.log(`[搜索] 搜索词: ${args.query}`);
+          console.log(`[API #${reqId}] 搜索: ${args.query}`);
           res.write(`data: ${JSON.stringify({ content: `🔍 搜索: ${args.query}` })}\n\n`);
           const searchResults = await webSearch(args.query);
-          console.log(`[搜索] 返回 ${searchResults.length} 条结果`);
           const searchContent = formatSearchResults(args.query, searchResults);
-          console.log(`[搜索] 格式化后内容长度: ${searchContent.length} 字符`);
-          console.log(`[搜索] 格式化后内容预览:\n${searchContent}`);
-          msgs.push({ role: 'assistant', content: '', tool_calls: firstResult.tool_calls });
-          msgs.push({ role: 'tool', content: searchContent, tool_call_id: tc.id });
+          searchMessages.push({ role: 'assistant', content: '', tool_calls: toolCallsFromStream });
+          searchMessages.push({ role: 'tool', content: searchContent, tool_call_id: tc.id });
         }
       }
-      console.log(`[API] 基于搜索结果流式生成回答，当前消息数: ${msgs.length}`);
-      // 基于搜索结果流式生成回答
-      let chunkCount = 0;
-      let contentCount = 0;
-      let thinkingCount = 0;
-      let sampleCount = 0;
-      for await (const chunk of chatStream(msgs, model)) {
+
+      // 第二次流式调用（带搜索结果）
+      console.log(`[API #${reqId}] 基于搜索结果二次流式生成回答`);
+      chunkCount = 0;
+      contentCount = 0;
+      for await (const chunk of chatStream(searchMessages, model)) {
         chunkCount++;
-        const isThinking = chunk.startsWith('__THINKING__');
-        if (!isThinking) {
+        if (chunk.startsWith('__THINKING__')) {
+          res.write(`data: ${JSON.stringify({ thinking: chunk.slice(12) })}\n\n`);
+        } else if (chunk.startsWith('__STATS__')) {
+          res.write(`data: ${JSON.stringify({ content: chunk })}\n\n`);
+        } else if (!chunk.startsWith('__TOOL_CALL__')) {
           contentCount++;
-          // 只打印前 5 个 content chunk 作为样本
-          if (contentCount <= 5) {
-            console.log(`[SSE] content chunk #${contentCount}: "${chunk}"`);
-          }
-        } else {
-          thinkingCount++;
+          res.write(`data: ${JSON.stringify({ content: chunk })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify(isThinking ? { thinking: chunk.slice(12) } : { content: chunk })}\n\n`);
       }
-      console.log(`[SSE] 共发送 ${chunkCount} 个 chunk，其中 content: ${contentCount}, thinking: ${thinkingCount}`);
-      console.log(`[perf] chat: ${Date.now()-t0}ms done (with search)`);
-    } else {
-      // 模型决定不需要搜索，流式返回回答
-      console.log(`[API] 模型决定不需要搜索，流式生成回答`);
-      let chunkCount = 0;
-      let contentCount = 0;
-      let thinkingCount = 0;
-      for await (const chunk of chatStream(msgs, model)) {
-        chunkCount++;
-        const isThinking = chunk.startsWith('__THINKING__');
-        if (!isThinking) {
-          contentCount++;
-          // 只打印前 5 个 content chunk 作为样本
-          if (contentCount <= 5) {
-            console.log(`[SSE] content chunk #${contentCount}: "${chunk}"`);
-          }
-        } else {
-          thinkingCount++;
-        }
-        res.write(`data: ${JSON.stringify(isThinking ? { thinking: chunk.slice(12) } : { content: chunk })}\n\n`);
-      }
-      console.log(`[SSE] 共发送 ${chunkCount} 个 chunk，其中 content: ${contentCount}, thinking: ${thinkingCount}`);
-      console.log(`[perf] chat: ${Date.now()-t0}ms done (no search needed)`);
+      console.log(`[API #${reqId}] 二次流式结束: ${contentCount} content chunks`);
     }
+
+    console.log(`[API #${reqId}] 完成: ${Date.now()-t0}ms`);
     res.write('data: [DONE]\n\n');
   } catch (err) {
     console.error('[API] 流式聊天失败:', err);
-    res.write(`data: ${JSON.stringify({ error: '\u6A21\u578B\u8C03\u7528\u5931\u8D25' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ error: '模型调用失败' })}\n\n`);
   }
 
   res.end();
@@ -160,8 +228,10 @@ app.get('/api/health', (_req, res) => {
 // 重启服务
 app.post('/api/restart', (_req, res) => {
   res.json({ ok: true });
-  console.log('[重启] 收到重启请求，1秒后退出...');
-  setTimeout(() => process.exit(0), 1000);
+  console.log('[重启] 触发文件变更，tsx watch 将自动重启...');
+  // 触碰当前文件让 tsx watch 检测到变更后自动重启
+  const now = new Date();
+  fs.utimes(__filename, now, now, () => {});
 });
 
 // 获取本地模型列表
@@ -251,7 +321,7 @@ app.listen(config.port, () => {
 ║  Running on http://localhost:${config.port}   ║
 ║  Model: ${config.ollama.model.padEnd(26)}║
 ║  Feishu: ${config.feishu.appId ? '✅ Configured' : '❌ Not configured'.padEnd(25)}║
-║  Mode:   Polling (2s)                ║
+║  Mode:   WebSocket                    ║
 ╚══════════════════════════════════════╝
   `);
 

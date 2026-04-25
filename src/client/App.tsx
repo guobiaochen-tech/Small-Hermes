@@ -3,9 +3,10 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 interface Message {
   role: 'user' | 'assistant';
   content: string;
+  images?: string[];  // 图片 base64（只在 API 请求用，不进 localStorage）
   thinking?: string;
   stats?: { tokens: number; tps: number };
-  done?: boolean;  // 标记消息是否完成生成
+  done?: boolean;
 }
 
 interface Conversation {
@@ -56,6 +57,13 @@ function IconRestart() {
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" />
       <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+  );
+}
+function IconAttach() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
     </svg>
   );
 }
@@ -116,16 +124,22 @@ export default function App() {
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+  const userScrolledUp = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const thinkingContainerRef = useRef<HTMLDivElement | null>(null);
-  const [streamTick, setStreamTick] = useState(0);
 
   const activeConv = conversations.find((c) => c.id === activeId) || conversations[0];
   const messages = activeConv?.messages || [];
 
-  // 持久化会话
+  // 持久化会话（只存无图片的消息，避免大 base64 撑爆 localStorage）
   useEffect(() => {
-    localStorage.setItem('hermes-convs', JSON.stringify(conversations));
+    const storageData = conversations.map(c => ({
+      ...c,
+      messages: c.messages.map(({ images, ...rest }) => rest), // 去掉图片字段
+    }));
+    localStorage.setItem('hermes-convs', JSON.stringify(storageData));
   }, [conversations]);
 
   // 拉取本地模型列表
@@ -172,9 +186,33 @@ export default function App() {
     };
     return () => ev.close();
   }, []);
-
+  // 滚动到底部
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (userScrolledUp.current) return;
+    chatEndRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth' });
+  }, [messages, loading]);
+
+  // 用户滚动时检测是否主动上拉了
+  useEffect(() => {
+    const el = chatContainerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      userScrolledUp.current = distFromBottom > 80;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // 新消息时恢复自动滚动
+  useEffect(() => {
+    if (!loading) userScrolledUp.current = false;
+  }, [loading]);
+
+  // 推理过程自动滚到底
+  useEffect(() => {
+    if (!loading || !thinkingContainerRef.current) return;
+    thinkingContainerRef.current.scrollTop = thinkingContainerRef.current.scrollHeight;
   }, [messages, loading]);
 
   // 点击外部关闭菜单
@@ -197,19 +235,182 @@ export default function App() {
     );
   }, []);
 
+  // 文件上传处理
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // 重置 input，允许重复选同一个文件
+    e.target.value = '';
+
+    // 首条消息设为对话标题
+    if (messages.length === 0) {
+      const title = file.name.length > 20 ? file.name.slice(0, 20) + '…' : file.name;
+      setConversations((prev) =>
+        prev.map((c) => (c.id === activeConv.id ? { ...c, title } : c))
+      );
+    }
+
+    // 显示上传中消息
+    const uploadingMsg: Message = { role: 'user', content: '📎 正在上传…' };
+    const uploadIdx = messages.length;
+    updateConvMessages(activeConv.id, (prev) => [...prev, uploadingMsg]);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/upload', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('上传失败');
+      const result = await res.json();
+
+      // 替换上传中消息为实际内容
+      if (result.type === 'image') {
+        // 图片：displayMessage 无图片（UI 显示），用 images 字段传给 API
+        const displayMsg: Message = { role: 'user', content: `📷 图片: ${result.fileName}` };
+        const apiMsg: Message = { role: 'user', content: '📷 图片', images: [result.data] };
+        updateConvMessages(activeConv.id, (prev) => {
+          const updated = [...prev];
+          updated[uploadIdx] = displayMsg;
+          return updated;
+        });
+        // 直接发送带图片的 API 请求
+        await sendWithImages(apiMsg);
+      } else {
+        // 文字文件：显示内容
+        const displayMsg: Message = { role: 'user', content: result.data || `📄 上传了: ${result.fileName}` };
+        updateConvMessages(activeConv.id, (prev) => {
+          const updated = [...prev];
+          updated[uploadIdx] = displayMsg;
+          return updated;
+        });
+        // 发送消息（不包含文件内容，因为已作为用户消息显示）
+        await sendWithText(result.data || '');
+      }
+    } catch (err) {
+      console.error('[上传] 失败:', err);
+      updateConvMessages(activeConv.id, (prev) => {
+        const updated = [...prev];
+        updated[uploadIdx] = { role: 'user', content: '❌ 上传失败' };
+        return updated;
+      });
+    }
+  };
+
+  // 发送带图片的消息
+  const sendWithImages = async (userMsg: Message) => {
+    if (loading || !activeConv) return;
+
+    // 直接构建消息列表，不依赖闭包（React 18 concurrent mode 陷阱修复）
+    const currentMessages = messages.filter(m => m.content !== '📎 正在上传…'); // 去掉已替换的上传中消息
+    const newMessages = [...currentMessages, userMsg];
+
+    updateConvMessages(activeConv.id, (prev) => [...prev, { role: 'assistant', content: '', thinking: '', done: false }]);
+    setLoading(true);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: newMessages, model }),
+      });
+      if (!res.ok) throw new Error('请求失败');
+      await handleStreamResponse(res);
+    } catch {
+      updateConvMessages(activeConv.id, (prev) => {
+        const updated = [...prev];
+        updated[updated.length - 1] = { role: 'assistant', content: '⚠️ 连接失败，请检查服务是否运行' };
+        return updated;
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 发送文本消息
+  const sendWithText = async (text: string) => {
+    if (loading || !activeConv) return;
+    const currentMessages = messages.filter(m => m.content !== '📎 正在上传…');
+    const newMessages = [...currentMessages, { role: 'user' as const, content: text }];
+    updateConvMessages(activeConv.id, (prev) => [...prev, { role: 'assistant', content: '', thinking: '', done: false }]);
+    setInput('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: newMessages, model }),
+      });
+      if (!res.ok) throw new Error('请求失败');
+      await handleStreamResponse(res);
+    } catch {
+      updateConvMessages(activeConv.id, (prev) => {
+        const updated = [...prev];
+        updated[updated.length - 1] = { role: 'assistant', content: '⚠️ 连接失败，请检查服务是否运行' };
+        return updated;
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 流式响应处理
+  const handleStreamResponse = async (res: Response) => {
+    const reader = res.body?.getReader();
+    const decoder = new TextDecoder();
+    let assistantContent = '';
+    let thinkingContent = '';
+
+    while (reader) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n');
+      let hasUpdate = false;
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.content) {
+              if (parsed.content.startsWith('__STATS__')) {
+                // stats 在流末处理
+                continue;
+              }
+              assistantContent += parsed.content;
+              hasUpdate = true;
+            }
+            if (parsed.thinking) {
+              thinkingContent += parsed.thinking;
+              hasUpdate = true;
+            }
+          } catch {}
+        }
+      }
+      if (hasUpdate) {
+        updateConvMessages(activeConv.id, (prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent, done: false };
+          return updated;
+        });
+      }
+    }
+    updateConvMessages(activeConv.id, (prev) => {
+      const updated = [...prev];
+      updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, done: true };
+      return updated;
+    });
+    if (inputRef.current) inputRef.current.style.height = 'auto';
+  };
+
+  // 主发送函数
   const sendMessage = useCallback(async () => {
     const text = input.trim();
     if (!text || loading || !activeConv) return;
 
-    // 重置 streamTick，避免影响之前消息的状态判断
-    setStreamTick(0);
-
-    const userMessage: Message = { role: 'user', content: text };
-    const newMessages = [...messages, userMessage];
+    const newMessages = [...messages, { role: 'user' as const, content: text }];
     updateConvMessages(activeConv.id, () => newMessages);
     setInput('');
     setLoading(true);
-    if (inputRef.current) inputRef.current.style.height = 'auto';
 
     // 如果是第一条消息，用前几个字作为标题
     if (messages.length === 0) {
@@ -228,74 +429,7 @@ export default function App() {
         body: JSON.stringify({ messages: newMessages, model }),
       });
       if (!res.ok) throw new Error('请求失败');
-
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let assistantContent = '';
-      let thinkingContent = '';
-      let assistantStats: { tokens: number; tps: number } | undefined;
-
-      while (reader) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        let hasUpdate = false;
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') break;
-            try {
-              const parsed = JSON.parse(data);
-              if (parsed.content) {
-                if (parsed.content.startsWith('__STATS__')) {
-                  try { assistantStats = JSON.parse(parsed.content.slice(9)); } catch {}
-                  continue;
-                }
-                assistantContent += parsed.content;
-                hasUpdate = true;
-              }
-              if (parsed.thinking) {
-                thinkingContent += parsed.thinking;
-                console.log('[前端] 收到 thinking chunk, 当前长度:', thinkingContent.length);
-                hasUpdate = true;
-              }
-            } catch (e) {
-              console.error('[前端] 解析 SSE 数据失败:', data, e);
-            }
-          }
-        }
-        // 每收到一个完整的 SSE chunk，强制立即渲染
-        if (hasUpdate) {
-          updateConvMessages(activeConv.id, (prev) => {
-            const updated = [...prev];
-            updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent, done: false };
-            return updated;
-          });
-          // 在下一个事件循环中更新 streamTick，避免同一个批处理
-          requestAnimationFrame(() => {
-            setStreamTick(1);
-          });
-          // 自动滚动到推理内容底部
-          requestAnimationFrame(() => {
-            thinkingContainerRef.current?.scrollTo(0, thinkingContainerRef.current.scrollHeight);
-          });
-        }
-      }
-      if (assistantStats) {
-        updateConvMessages(activeConv.id, (prev) => {
-          const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, stats: assistantStats, done: true };
-          return updated;
-        });
-      } else {
-        // 没有 stats，也标记为完成
-        updateConvMessages(activeConv.id, (prev) => {
-          const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, done: true };
-          return updated;
-        });
-      }
+      await handleStreamResponse(res);
     } catch {
       updateConvMessages(activeConv.id, (prev) => {
         const updated = [...prev];
@@ -388,7 +522,7 @@ export default function App() {
       <div className="conv-list">
         <button className="conv-new-btn" onClick={newConversation}>+ 新建对话</button>
         <div className="conv-items">
-          {conversations.map((conv) => (
+          {conversations.slice().sort((a, b) => (a.id === 'feishu' ? -1 : b.id === 'feishu' ? 1 : 0)).map((conv) => (
             <div
               key={conv.id}
               className={`conv-item${conv.id === activeId ? ' active' : ''}`}
@@ -437,14 +571,7 @@ export default function App() {
         </header>
 
         {/* 聊天区域 */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px', background: 'var(--bg-chat)' }}>
-          {/* 调试区域 */}
-          <div style={{ background: '#ffeb3b', padding: '10px', marginBottom: '10px', fontSize: '12px' }}>
-            <strong>调试信息：</strong><br/>
-            Stream Tick: {streamTick}<br/>
-            最后一条消息: {messages.length > 0 ? `thinking=${JSON.stringify(messages[messages.length - 1].thinking)}, content长度=${messages[messages.length - 1].content?.length || 0}` : '无'}
-          </div>
-
+        <div ref={chatContainerRef} style={{ flex: 1, overflowY: 'auto', padding: '20px', background: 'var(--bg-chat)' }}>
           {messages.length === 0 && (
             <div style={{
               display: 'flex', flexDirection: 'column', alignItems: 'center',
@@ -457,18 +584,17 @@ export default function App() {
           )}
 
           {messages.map((msg, i) => {
-            // 调试日志
             return (
             <div key={i} style={{
               display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 12,
             }}>
               <div style={{ maxWidth: '75%' }}>
                 {msg.role === 'assistant' && (msg.thinking || (loading && i === messages.length - 1)) && (
-                  <details open style={{ marginBottom: 6 }}>
+                  <details open style={{ marginBottom: 6, width: '100%', display: 'block' }}>
                     <summary
                       style={{
                         cursor: 'pointer', color: 'var(--text-muted)', fontSize: 12,
-                        userSelect: 'none', padding: '2px 0', display: 'flex', alignItems: 'center', gap: 4,
+                        userSelect: 'none', padding: '2px 0', display: 'flex', alignItems: 'center', gap: 4, width: '100%',
                       }}
                     >
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
@@ -485,8 +611,8 @@ export default function App() {
                       fontSize: 12, color: 'var(--text-muted)', background: 'var(--bg-secondary)',
                       padding: '8px 12px', marginTop: 4, borderRadius: '0 6px 6px 0',
                       whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
-                      maxHeight: '200px', overflow: 'auto',
-                      border: '1px solid var(--border)', borderLeft: '3px solid #ff9800',
+                      maxHeight: '200px', overflow: 'auto', width: '100%', boxSizing: 'border-box',
+                      border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)',
                       minHeight: '40px',
                     }}>
                       {msg.thinking ? msg.thinking : ''}
@@ -536,6 +662,27 @@ export default function App() {
           padding: '16px 20px', borderTop: '1px solid var(--border)', background: 'var(--bg-secondary)', flexShrink: 0,
         }}>
           <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', maxWidth: 800, margin: '0 auto' }}>
+            {/* 附件按钮 */}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={loading || activeConv?.id === 'feishu'}
+              title="上传文件"
+              style={{
+                background: 'none', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                padding: '8px 10px', cursor: loading ? 'not-allowed' : 'pointer',
+                color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+                opacity: loading ? 0.5 : 1,
+              }}
+            >
+              <IconAttach />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,.pdf,.docx,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.xml,.yaml,.yml,.log"
+              style={{ display: 'none' }}
+              onChange={handleFileSelect}
+            />
             <textarea
               ref={inputRef} value={input} onChange={handleInputChange} onKeyDown={handleKeyDown}
               placeholder={activeConv?.id === 'feishu' ? '飞书消息只读，请在飞书客户端回复' : '输入消息... (Enter 发送，Shift+Enter 换行)'}
@@ -621,7 +768,12 @@ export default function App() {
           </p>
           <div className="modal-actions">
             <button className="btn-ghost" onClick={() => setShowRestart(false)}>取消</button>
-            <button className="btn-primary" onClick={() => { setShowRestart(false); fetch('/api/restart', { method: 'POST' }); }}>确认重启</button>
+            <button className="btn-primary" onClick={async () => {
+              setShowRestart(false);
+              await fetch('/api/restart', { method: 'POST' });
+              // 等 2 秒让服务完全重启后刷新页面
+              setTimeout(() => location.reload(), 2000);
+            }}>确认重启</button>
           </div>
         </Modal>
       )}

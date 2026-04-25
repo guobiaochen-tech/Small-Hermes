@@ -3,6 +3,7 @@ import { config } from './config.js';
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  images?: string[];  // base64 图片（Ollama 要求裸 base64，不含 data:image/... 前缀）
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }
@@ -58,6 +59,25 @@ export const TOOLS = [
   },
 ];
 
+/**
+ * Ollama 的 /api/chat images 字段要求裸 base64（不含 data:image/...;base64, 前缀）。
+ * 此函数清理所有消息中的 images 字段。
+ */
+function cleanImages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map(m => {
+    if (m.images && m.images.length > 0) {
+      return {
+        ...m,
+        images: m.images.map(img => {
+          const commaIdx = img.indexOf(',');
+          return commaIdx > 0 ? img.slice(commaIdx + 1) : img;
+        }),
+      };
+    }
+    return m;
+  });
+}
+
 /** 非流式调用 */
 export async function chatComplete(
   messages: ChatMessage[],
@@ -66,7 +86,7 @@ export async function chatComplete(
 ): Promise<LLMResponse> {
   const body: any = {
     model: model || config.ollama.model,
-    messages,
+    messages: cleanImages(messages),
     stream: false,
   };
   if (tools) body.tools = tools;
@@ -91,7 +111,7 @@ export async function* chatStream(
 ): AsyncGenerator<string> {
   const body: any = {
     model: model || config.ollama.model,
-    messages,
+    messages: cleanImages(messages),
     stream: true,
   };
   if (tools) body.tools = tools;

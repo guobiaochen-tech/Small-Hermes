@@ -4,8 +4,8 @@
   --bg-chat: #141414;
   --text: #e5e5e5;
   --text-muted: #888;
-  --accent: #a89e94;
-  --accent-hover: #b8ae9e;
+  --accent: #c4bcae;
+  --accent-hover: #d4ccbe;
   --border: #2a2a2a;
   --user-bubble: #2a2540;
   --assistant-bubble: #1e1e1e;
@@ -119,9 +119,19 @@ details:not([open]) summary::after {
   font-family: inherit;
   outline: none;
   margin-bottom: 16px;
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
 .modal-box input:focus, .modal-box select:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(196, 188, 174, 0.15);
+}
+.modal-box select {
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
 }
 .modal-actions {
   display: flex;
@@ -139,7 +149,8 @@ details:not([open]) summary::after {
 }
 .btn-primary {
   background: var(--accent);
-  color: #fff;
+  color: #141414;
+  font-weight: 600;
 }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-ghost {
@@ -147,7 +158,10 @@ details:not([open]) summary::after {
   color: var(--text-muted);
   border: 1px solid var(--border) !important;
 }
-.btn-ghost:hover { color: var(--text); }
+.btn-ghost:hover {
+  color: var(--accent);
+  border-color: var(--accent) !important;
+}
 
 /* ─── 左侧会话列表 ─── */
 .conv-list {

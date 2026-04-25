@@ -1,6 +1,6 @@
 import * as lark from '@larksuiteoapi/node-sdk';
 import { config } from './config.js';
-import { chatComplete, chatStream, TOOLS, ChatMessage } from './llm.js';
+import { chatComplete, chatStream, TOOLS, ChatMessage, getSystemPrompt } from './llm.js';
 import { webSearch, formatSearchResults } from './search.js';
 
 const client = new lark.Client({
@@ -318,12 +318,15 @@ async function handleImMessage(data: any) {
 
     try {
       const hasTools = config.tavily.apiKey ? TOOLS : undefined;
-    const messages: ChatMessage[] = [{ role: 'user', content: text }];
+      const messages: ChatMessage[] = [
+        { role: 'system', content: getSystemPrompt() },
+        { role: 'user', content: text },
+      ];
 
-    // 如有工具，先非流式检查是否需要搜索
-    if (hasTools) {
+      // Function Calling: 让模型自己决定是否需要搜索
       const firstResult = await chatComplete(messages, undefined, hasTools);
       if (firstResult.tool_calls?.length) {
+        // 模型决定需要搜索
         for (const tc of firstResult.tool_calls) {
           if (tc.function.name === 'web_search') {
             const args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
@@ -336,12 +339,11 @@ async function handleImMessage(data: any) {
             messages.push({ role: 'tool', content: searchContent, tool_call_id: tc.id });
           }
         }
-        // 需要搜索 → 走流式生成
+        // 基于搜索结果流式生成回答
         await doStreamAndReply(chatId, messages, hasTools);
       } else {
-        // 不需要搜索 → 直接用 firstResult 的内容
+        // 模型决定不需要搜索，直接返回回答
         console.log(`[飞书] → 回复 ${(firstResult.content || '').length} 字（单次调用，无需搜索）`);
-
         if (firstResult.thinking) {
           // 有推理内容 → 用卡片形式显示
           let cardId = '';
@@ -361,11 +363,6 @@ async function handleImMessage(data: any) {
         }
         if (_broadcast) _broadcast({ type: 'feishu_assistant', content: firstResult.content || '' });
       }
-      return;
-    }
-
-    // 无 Tavily 配置 → 直接流式
-    await doStreamAndReply(chatId, messages, undefined);
     } catch (err) {
       console.error('[飞书] 模型调用失败:', err);
       await replyMessage(chatId, 'chat_id', '⚠️ 模型调用失败，请检查 Ollama 是否运行');

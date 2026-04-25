@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { flushSync } from 'react-dom';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
   thinking?: string;
   stats?: { tokens: number; tps: number };
+  done?: boolean;  // 标记消息是否完成生成
 }
 
 interface Conversation {
@@ -201,6 +201,9 @@ export default function App() {
     const text = input.trim();
     if (!text || loading || !activeConv) return;
 
+    // 重置 streamTick，避免影响之前消息的状态判断
+    setStreamTick(0);
+
     const userMessage: Message = { role: 'user', content: text };
     const newMessages = [...messages, userMessage];
     updateConvMessages(activeConv.id, () => newMessages);
@@ -216,7 +219,7 @@ export default function App() {
       );
     }
 
-    updateConvMessages(activeConv.id, (prev) => [...prev, { role: 'assistant', content: '' }]);
+    updateConvMessages(activeConv.id, (prev) => [...prev, { role: 'assistant', content: '', thinking: '', done: false }]);
 
     try {
       const res = await fetch('/api/chat', {
@@ -254,20 +257,24 @@ export default function App() {
               }
               if (parsed.thinking) {
                 thinkingContent += parsed.thinking;
+                console.log('[前端] 收到 thinking chunk, 当前长度:', thinkingContent.length);
                 hasUpdate = true;
               }
-            } catch {}
+            } catch (e) {
+              console.error('[前端] 解析 SSE 数据失败:', data, e);
+            }
           }
         }
         // 每收到一个完整的 SSE chunk，强制立即渲染
         if (hasUpdate) {
-          flushSync(() => {
-            updateConvMessages(activeConv.id, (prev) => {
-              const updated = [...prev];
-              updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent };
-              return updated;
-            });
-            setStreamTick((n) => n + 1);
+          updateConvMessages(activeConv.id, (prev) => {
+            const updated = [...prev];
+            updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent, done: false };
+            return updated;
+          });
+          // 在下一个事件循环中更新 streamTick，避免同一个批处理
+          requestAnimationFrame(() => {
+            setStreamTick(1);
           });
           // 自动滚动到推理内容底部
           requestAnimationFrame(() => {
@@ -278,7 +285,14 @@ export default function App() {
       if (assistantStats) {
         updateConvMessages(activeConv.id, (prev) => {
           const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, stats: assistantStats };
+          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, stats: assistantStats, done: true };
+          return updated;
+        });
+      } else {
+        // 没有 stats，也标记为完成
+        updateConvMessages(activeConv.id, (prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: 'assistant', content: assistantContent, thinking: thinkingContent || undefined, done: true };
           return updated;
         });
       }
@@ -424,6 +438,13 @@ export default function App() {
 
         {/* 聊天区域 */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '20px', background: 'var(--bg-chat)' }}>
+          {/* 调试区域 */}
+          <div style={{ background: '#ffeb3b', padding: '10px', marginBottom: '10px', fontSize: '12px' }}>
+            <strong>调试信息：</strong><br/>
+            Stream Tick: {streamTick}<br/>
+            最后一条消息: {messages.length > 0 ? `thinking=${JSON.stringify(messages[messages.length - 1].thinking)}, content长度=${messages[messages.length - 1].content?.length || 0}` : '无'}
+          </div>
+
           {messages.length === 0 && (
             <div style={{
               display: 'flex', flexDirection: 'column', alignItems: 'center',
@@ -442,7 +463,7 @@ export default function App() {
               display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 12,
             }}>
               <div style={{ maxWidth: '75%' }}>
-                {msg.role === 'assistant' && (msg.thinking || streamTick > 0) && (
+                {msg.role === 'assistant' && (msg.thinking || (loading && i === messages.length - 1)) && (
                   <details open style={{ marginBottom: 6 }}>
                     <summary
                       style={{
@@ -455,9 +476,9 @@ export default function App() {
                         <span>推理过程</span>
                       </span>
                       <span style={{
-                        marginLeft: 'auto', fontSize: 11, color: msg.content ? '#4caf50' : '#ff9800',
+                        marginLeft: 'auto', fontSize: 11, color: msg.done !== undefined ? (msg.done ? '#4caf50' : '#ff9800') : (msg.content ? '#4caf50' : '#ff9800'),
                       }}>
-                        {msg.content ? '✓ 完成' : '● 进行中'}
+                        {msg.done !== undefined ? (msg.done ? '✓ 完成' : '● 进行中') : (msg.content ? '✓ 完成' : '● 进行中')}
                       </span>
                     </summary>
                     <div ref={thinkingContainerRef} style={{
@@ -466,6 +487,7 @@ export default function App() {
                       whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
                       maxHeight: '200px', overflow: 'auto',
                       border: '1px solid var(--border)', borderLeft: '3px solid #ff9800',
+                      minHeight: '40px',
                     }}>
                       {msg.thinking ? msg.thinking : ''}
                     </div>
@@ -473,7 +495,7 @@ export default function App() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          e.currentTarget.parentElement!.querySelector('div')!.innerHTML = msg.thinking;
+                          e.currentTarget.parentElement!.querySelector('div')!.innerHTML = msg.thinking || '';
                           e.currentTarget.remove();
                         }}
                         style={{

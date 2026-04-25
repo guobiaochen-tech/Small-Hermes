@@ -41,9 +41,20 @@ export async function webSearch(query: string): Promise<SearchResult[]> {
  * 格式化搜索结果给模型用
  */
 export function formatSearchResults(query: string, results: SearchResult[]): string {
-  let text = `搜索关键词: ${query}\n\n搜索结果:\n`;
-  for (const r of results) {
-    text += `\n---\n标题: ${r.title}\n链接: ${r.url}\n摘要: ${r.content}\n`;
+  if (results.length === 0) {
+    return `搜索关键词: ${query}\n\n搜索结果: 无相关结果`;
   }
+  
+  let text = `搜索关键词: ${query}\n\n搜索结果:`;
+  
+  // 只取前 3 条最相关的结果
+  for (let i = 0; i < Math.min(results.length, 3); i++) {
+    const r = results[i];
+    // 限制每条结果的长度，避免 token 消耗过大
+    const title = r.title.length > 80 ? r.title.slice(0, 80) + '...' : r.title;
+    const content = r.content.length > 300 ? r.content.slice(0, 300) + '...' : r.content;
+    text += `\n\n${i + 1}. ${title}\n   ${content}`;
+  }
+  
   return text;
 }

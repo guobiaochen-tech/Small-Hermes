@@ -22,6 +22,24 @@ export interface LLMResponse {
   thinking?: string;
 }
 
+// ─── 系统提示词 ────────────────────────────────────────────────
+export function getSystemPrompt(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const d = now.getDate();
+  const h = now.getHours().toString().padStart(2, '0');
+  const min = now.getMinutes().toString().padStart(2, '0');
+  return (
+    `你是 Small Hermes，一个运行在本地的 AI 聊天助手，基于 Ollama 运行。` +
+    `当前日期是 ${y}年${m}月${d}日，时间 ${h}:${min}。` +
+    `你不是 AI 角色，而是工具型助手。回答直截了当，不要角色扮演，不要玩文字游戏。` +
+    `用户问什么就答什么。` +
+    `你可以通过 web_search 工具搜索互联网获取实时信息。` +
+    `重要：当搜索工具返回结果后，必须基于搜索结果回答问题，不要忽略搜索结果。`
+  );
+}
+
 // ─── 工具定义 ────────────────────────────────────────────────────
 export const TOOLS = [
   {
@@ -92,6 +110,7 @@ export async function* chatStream(
   const decoder = new TextDecoder();
   let buffer = '';
   let toolCalls: ToolCall[] = [];
+  let chunkCount = 0;  // 调试用：计数器
 
   while (true) {
     const { done, value } = await reader.read();
@@ -105,11 +124,23 @@ export async function* chatStream(
       if (!line.trim()) continue;
       try {
         const parsed = JSON.parse(line);
+        // 调试：打印前 5 条原始消息结构
+        if (chunkCount < 5) {
+          console.log(`[Ollama] 原始消息 #${chunkCount + 1}:`, JSON.stringify({
+            hasThinking: !!parsed.message?.thinking,
+            hasContent: !!parsed.message?.content,
+            thinkingLen: parsed.message?.thinking?.length || 0,
+            contentLen: parsed.message?.content?.length || 0,
+          }));
+          chunkCount++;
+        }
         if (parsed.message?.thinking) {
-          yield `__THINKING__${parsed.message.thinking}`;
+          const chunk = `__THINKING__${parsed.message.thinking}`;
+          yield chunk;
         }
         if (parsed.message?.content) {
-          yield parsed.message.content;
+          const chunk = parsed.message.content;
+          yield chunk;
         }
         if (parsed.message?.tool_calls) {
           for (const tc of parsed.message.tool_calls) {

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import express from 'express';
 import { config } from './config.js';
-import { chatStream, chatComplete, ChatMessage, TOOLS } from './llm.js';
+import { chatStream, chatComplete, ChatMessage, TOOLS, getSystemPrompt } from './llm.js';
 import { startFeishuPolling, setBroadcast } from './feishu.js';
 import { webSearch, formatSearchResults } from './search.js';
 
@@ -65,6 +65,10 @@ app.post('/api/chat', async (req, res) => {
     return;
   }
 
+  // 注入系统提示词，让模型知道自己是谁
+  const systemMsg: ChatMessage = { role: 'system', content: getSystemPrompt() };
+  const msgs: ChatMessage[] = [systemMsg, ...messages];
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -74,50 +78,70 @@ app.post('/api/chat', async (req, res) => {
   try {
     const hasTools = config.tavily.apiKey ? TOOLS : undefined;
 
-    // 没有工具配置 → 直接流式
-    if (!hasTools) {
-      console.log(`[perf] chat: ${Date.now()-t0}ms to start stream`);
-      for await (const chunk of chatStream(messages, model)) {
-        const isThinking = chunk.startsWith('__THINKING__');
-        res.write(`data: ${JSON.stringify(isThinking ? { thinking: chunk.slice(12) } : { content: chunk })}\n\n`);
-      }
-      console.log(`[perf] chat: ${Date.now()-t0}ms done`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-      return;
-    }
+    // Function Calling: 让模型自己决定是否需要搜索
+    const firstResult = await chatComplete(msgs, model, hasTools);
 
-    // 有工具配置 → 先非流式检查是否需要搜索
-    const firstResult = await chatComplete(messages, model, hasTools);
-
-    if (firstResult.tool_calls?.length) {
+      if (firstResult.tool_calls?.length) {
+      // 模型决定需要搜索
+      console.log(`[API] 模型决定需要搜索，工具调用数: ${firstResult.tool_calls.length}`);
       for (const tc of firstResult.tool_calls) {
         if (tc.function.name === 'web_search') {
           const args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments;
-          console.log(`[搜索] ${args.query}`);
-          res.write(`data: ${JSON.stringify({ content: `\u{1F50D} \u641C\u7D22: ${args.query}` })}\n\n`);
+          console.log(`[搜索] 搜索词: ${args.query}`);
+          res.write(`data: ${JSON.stringify({ content: `🔍 搜索: ${args.query}` })}\n\n`);
           const searchResults = await webSearch(args.query);
+          console.log(`[搜索] 返回 ${searchResults.length} 条结果`);
           const searchContent = formatSearchResults(args.query, searchResults);
-          messages.push({ role: 'assistant', content: '', tool_calls: firstResult.tool_calls });
-          messages.push({ role: 'tool', content: searchContent, tool_call_id: tc.id });
+          console.log(`[搜索] 格式化后内容长度: ${searchContent.length} 字符`);
+          console.log(`[搜索] 格式化后内容预览:\n${searchContent}`);
+          msgs.push({ role: 'assistant', content: '', tool_calls: firstResult.tool_calls });
+          msgs.push({ role: 'tool', content: searchContent, tool_call_id: tc.id });
         }
       }
-      for await (const chunk of chatStream(messages, model)) {
+      console.log(`[API] 基于搜索结果流式生成回答，当前消息数: ${msgs.length}`);
+      // 基于搜索结果流式生成回答
+      let chunkCount = 0;
+      let contentCount = 0;
+      let thinkingCount = 0;
+      let sampleCount = 0;
+      for await (const chunk of chatStream(msgs, model)) {
+        chunkCount++;
         const isThinking = chunk.startsWith('__THINKING__');
+        if (!isThinking) {
+          contentCount++;
+          // 只打印前 5 个 content chunk 作为样本
+          if (contentCount <= 5) {
+            console.log(`[SSE] content chunk #${contentCount}: "${chunk}"`);
+          }
+        } else {
+          thinkingCount++;
+        }
         res.write(`data: ${JSON.stringify(isThinking ? { thinking: chunk.slice(12) } : { content: chunk })}\n\n`);
       }
+      console.log(`[SSE] 共发送 ${chunkCount} 个 chunk，其中 content: ${contentCount}, thinking: ${thinkingCount}`);
+      console.log(`[perf] chat: ${Date.now()-t0}ms done (with search)`);
     } else {
-      // 不需要搜索 → 直接用 firstResult 的内容，不再调第二次模型
-      console.log(`[perf] chat: ${Date.now()-t0}ms done (single call, no search)`);
-      const reply = firstResult.content || '';
-      const thinking = firstResult.thinking;
-      if (thinking) {
-        res.write(`data: ${JSON.stringify({ thinking })}\n\n`);
+      // 模型决定不需要搜索，流式返回回答
+      console.log(`[API] 模型决定不需要搜索，流式生成回答`);
+      let chunkCount = 0;
+      let contentCount = 0;
+      let thinkingCount = 0;
+      for await (const chunk of chatStream(msgs, model)) {
+        chunkCount++;
+        const isThinking = chunk.startsWith('__THINKING__');
+        if (!isThinking) {
+          contentCount++;
+          // 只打印前 5 个 content chunk 作为样本
+          if (contentCount <= 5) {
+            console.log(`[SSE] content chunk #${contentCount}: "${chunk}"`);
+          }
+        } else {
+          thinkingCount++;
+        }
+        res.write(`data: ${JSON.stringify(isThinking ? { thinking: chunk.slice(12) } : { content: chunk })}\n\n`);
       }
-      res.write(`data: ${JSON.stringify({ content: reply })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-      return;
+      console.log(`[SSE] 共发送 ${chunkCount} 个 chunk，其中 content: ${contentCount}, thinking: ${thinkingCount}`);
+      console.log(`[perf] chat: ${Date.now()-t0}ms done (no search needed)`);
     }
     res.write('data: [DONE]\n\n');
   } catch (err) {

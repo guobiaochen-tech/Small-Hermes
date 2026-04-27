@@ -6,3 +6,11 @@ client-dist/
 .DS_Store
 feishu_uploads/
 web_uploads/
+memories/
+sessions/
+wechat-config.json
+.last-chat.json
+.last-ollama-request.json
+wechat_uploads/
+feishu_uploads/
+web_uploads/

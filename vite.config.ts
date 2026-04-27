@@ -5,6 +5,7 @@ export default defineConfig({
   root: '.',
   server: {
     port: 5173,
+    host: true,
     proxy: {
       '/api': 'http://localhost:3000',    // 其他 API 仍走 Express
       '/webhook': 'http://localhost:3000',

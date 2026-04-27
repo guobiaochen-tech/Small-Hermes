@@ -3,7 +3,11 @@ import fs from 'fs';
 import path from 'path';
 import { config } from './config.js';
 import { chatStream, TOOLS, ChatMessage, getSystemPrompt } from './llm.js';
-import { webSearch, formatSearchResults } from './search.js';
+import { executeToolCalls } from './tools.js';
+import { saveUnifiedSession, getChatSession, setChatSession, clearChatSession, getCompressCount, incrementCompressCount, saveSession, type SessionMessage } from './sessions.js';
+import { createApproval, resolveApproval } from './approval.js';
+import { addMemory } from './memory.js';
+import { shouldCompress, compressMessages } from './compress.js';
 
 const client = new lark.Client({
   appId: config.feishu.appId,
@@ -20,12 +24,31 @@ export function setBroadcast(fn: (data: any) => void) {
   _broadcast = fn;
 }
 
+/** 最近一个发消息的用户 open_id（用于文档创建时授权） */
+let _lastSenderOpenId: string | null = null;
+export function getLastSenderOpenId(): string | null {
+  return _lastSenderOpenId;
+}
+
 // 已处理消息 ID（防重复）
 const seenMsgIds = new Set<string>();
 const serverStartTime = Date.now();
 
 // 每个 chat 一次只处理一条消息（防止 WS 重连回放 + 并发导致多个"正在思考"）
 const chatQueue = new Map<string, Promise<void>>();
+
+// 等待用户确认的 chat（chatId → approvalId），文本回复即可确认
+const chatApprovalMap = new Map<string, string>();
+
+// 已连接的飞书聊天（用于定时任务推送）
+const feishuChats = new Set<string>();
+export async function sendToFeishu(text: string): Promise<void> {
+  const promises = [];
+  for (const chatId of feishuChats) {
+    promises.push(replyMessage(chatId, 'chat_id', `⏰ ${text}`).catch(() => {}));
+  }
+  await Promise.all(promises);
+}
 
 /** 同个 chat 的消息串行处理：前一个处理完全完成后才执行 fn */
 async function processInOrder<T>(chatId: string, fn: () => Promise<T>): Promise<T> {
@@ -136,6 +159,25 @@ export async function readDocxText(filePath: string): Promise<string> {
   }
 }
 
+/** 提取 xlsx/xls 文字（CSV 格式，每个 sheet 用分隔符隔开） */
+export async function readXlsxText(filePath: string): Promise<string> {
+  try {
+    const XLSX = await import('xlsx');
+    const buf = fs.readFileSync(filePath);
+    const wb = XLSX.read(buf, { type: 'buffer' });
+    const sheets: string[] = [];
+    for (const name of wb.SheetNames) {
+      const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
+      if (csv.trim()) {
+        sheets.push(`── Sheet: ${name} ──\n${csv}`);
+      }
+    }
+    return sheets.join('\n\n') || '(空表格)';
+  } catch {
+    return '';
+  }
+}
+
 /** 获取文件类型信息 */
 export async function getFileTypeInfo(filePath: string): Promise<{ type: string; content: string; ext: string }> {
   const ext = path.extname(filePath).toLowerCase();
@@ -183,7 +225,7 @@ async function replyMessage(receiveId: string, receiveIdType: string, text: stri
   }
 }
 
-/** 构建回复卡片 */
+/** 构建回复卡片（灰色条、剧中） */
 function buildReplyCard(reply: string): string {
   const elements: any[] = [];
 
@@ -195,8 +237,8 @@ function buildReplyCard(reply: string): string {
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: '🤖 Small Hermes' },
-      template: 'purple',
+      title: { tag: 'plain_text', content: 'Small Hermes' },
+      template: 'grey',
     },
     elements,
   };
@@ -215,7 +257,7 @@ function sanitizeForFeishu(text: string): string {
 
 // ─── 流式更新卡片（打字机效果） ──────────────────────────────────
 
-/** 创建带流式模式的卡片实体，返回 card_id */
+/** 创建带流式模式的卡片实体（初始内容：点阵动画），返回 card_id */
 async function createStreamCard(): Promise<string> {
   const cardJson = {
     schema: '2.0',
@@ -224,12 +266,16 @@ async function createStreamCard(): Promise<string> {
       update_multi: true,
       wide_screen_mode: true,
     },
+    header: {
+      title: { tag: 'plain_text', content: 'Small Hermes' },
+      template: 'grey',
+    },
     body: {
       elements: [
         {
           tag: 'markdown',
           element_id: 'main_content',
-          content: '🧠 思考中…',
+          content: '⚡ 推理中',
         },
       ],
     },
@@ -311,75 +357,210 @@ async function replyCard(receiveId: string, receiveIdType: string, reply: string
   }
 }
 
-// 流式生成 + 卡片回复（用于需要搜索后或无需搜索时）
-async function doStreamAndReply(chatId: string, messages: ChatMessage[], hasTools: typeof TOOLS | undefined) {
-  // 创建流式思考卡片（极简：只显示"🧠 思考中…"）
-  let cardId = '';
-  let streamOk = false;
-  let seq = 0;
+/** 发送工具确认卡片（绿色header + 原生回调按钮，需飞书后台配 card.action.trigger 事件） */
+async function sendApprovalCard(chatId: string, approvalId: string, query: string) {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '🔍 联网搜索确认' },
+      template: 'green',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: `搜索关键词：**${query}**`,
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 允许' },
+            type: 'primary',
+            value: JSON.stringify({ approval_id: approvalId, approved: true }),
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '❌ 拒绝' },
+            type: 'danger',
+            value: JSON.stringify({ approval_id: approvalId, approved: false }),
+          },
+        ],
+      },
+    ],
+  };
+
   try {
-    cardId = await createStreamCard();
-    if (cardId) {
-      await sendStreamCard(chatId, 'chat_id', cardId);
-      streamOk = true;
-    }
+    await client.request({
+      method: 'POST',
+      url: '/open-apis/im/v1/messages',
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    console.log(`[飞书] 确认卡片已发送: ${query}`);
   } catch (err) {
-    console.error('[飞书] 流式卡片创建失败，降级:', err);
+    console.error('[飞书] 确认卡片发送失败:', err);
+    // 降级：发文本提示
+    await replyMessage(chatId, 'chat_id', `🔍 正在搜索：${query}`);
   }
+}
 
-  // 流式获取推理 + 内容
-  let thinkingText = '';
-  let replyText = '';
-  let answerStarted = false;
+/** 发送消息送达确认（紧跟前一条消息，从外部看像是挂在其下方） */
+async function sendReceiptCard(chatId: string) {
+  try {
+    await client.request({
+      method: 'POST',
+      url: '/open-apis/im/v1/messages',
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'text',
+        content: JSON.stringify({ text: '✅ 已收到  |  Small Hermes' }),
+      },
+    });
+  } catch (err) {
+    // 静默失败
+  }
+}
 
-  // 回答内容节流更新
-  let pendingUpdate = '';
-  let updateTimer: ReturnType<typeof setTimeout> | null = null;
+// ─── 流式生成 + 卡片回复（支持多轮 tool call）────────────────────
+async function doStreamAndReply(chatId: string, messages: ChatMessage[], hasTools: typeof TOOLS | undefined) {
+  // 消息送达确认
+  sendReceiptCard(chatId).catch(() => {});
 
-  const flushUpdate = async () => {
-    if (updateTimer) {
-      clearTimeout(updateTimer);
-      updateTimer = null;
+  // 多轮 tool call 循环
+  let totalReplyText = '';
+  let toolLines: string[] = [];
+  const msgs = [...messages];
+  const MAX_TOOL_ITERATIONS = 2;
+
+  for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+    let thinkingText = '';
+    let replyText = '';
+    let toolCallsFromStream: any[] = [];
+
+    for await (const chunk of chatStream(msgs, undefined, hasTools)) {
+      if (chunk.startsWith('__THINKING_FULL__')) {
+        try { thinkingText = JSON.parse(chunk.slice(17)); } catch {}
+      } else if (chunk.startsWith('__THINKING__')) {
+        thinkingText += chunk.slice(12);
+      } else if (chunk.startsWith('__TOOL_CALL__')) {
+        try {
+          toolCallsFromStream = JSON.parse(chunk.slice(13));
+          console.log(`[飞书] 工具调用: ${toolCallsFromStream.length} 个`);
+        } catch {}
+      } else if (chunk.startsWith('__STATS__')) {
+        continue;
+      } else {
+        replyText += chunk;
+        totalReplyText += chunk;
+      }
     }
-    if (pendingUpdate && streamOk) {
-      seq++;
-      const ok = await streamingUpdateText(cardId, pendingUpdate, seq);
-      if (!ok) streamOk = false;
-      pendingUpdate = '';
-    }
-  };
 
-  const scheduleUpdate = () => {
-    if (!updateTimer) {
-      updateTimer = setTimeout(flushUpdate, 100);
-    }
-  };
+    if (toolCallsFromStream.length > 0) {
+      // 对需要确认的工具（web_search），发送询问
+      for (const tc of toolCallsFromStream) {
+        const name = tc.function?.name || '';
+        if (name === 'web_search') {
+          const args = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
+          const query = args.query || '';
 
-  for await (const chunk of chatStream(messages, undefined, hasTools)) {
-    if (chunk.startsWith('__THINKING__')) {
-      thinkingText += chunk.slice(12);
-    } else if (chunk.startsWith('__STATS__') || chunk.startsWith('__TOOL_CALL__')) {
-      continue;
+          // 检查是否已设"一直允许"
+          const memoryMod = await import('./memory.js');
+          const { entries } = memoryMod.readMemory('memory');
+          const alwaysAllow = entries.some(e => e.includes('搜索无需确认') || e.includes('一直允许搜索') || e.includes('联网搜索无需确认'));
+          if (alwaysAllow) {
+            console.log(`[飞书] 搜索一直允许，直接执行: ${query}`);
+            continue; // 跳过确认，直接执行
+          }
+
+          const { id, promise } = createApproval(tc);
+          chatApprovalMap.set(chatId, id);
+          await replyMessage(chatId, 'chat_id', `🔍 需要搜索「**${query}**」，请选择：\n1 不允许\n2 允许\n3 一直允许（以后不再询问）\n（60秒超时自动取消）`);
+          const approved = await promise;
+          chatApprovalMap.delete(chatId); // 清理
+          if (!approved) {
+            tc._skipped = true;
+            msgs.push({ role: 'assistant', content: '', tool_calls: [tc] });
+            msgs.push({ role: 'tool', content: `用户取消了搜索「${query}」的请求`, tool_call_id: tc.id });
+            console.log(`[飞书] 用户取消搜索: ${query}`);
+          }
+        }
+      }
+      // 构建工具调用摘要，加到回复中
+      toolLines = [];
+      for (const tc of toolCallsFromStream) {
+        const name = tc.function?.name || '';
+        const args = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
+        const iconMap: Record<string, string> = { web_search: '🔍', memory_add: '💾', memory_read: '📖', memory_replace: '🔄', memory_remove: '🗑️', read_url: '📄', feishu_doc_create: '📝' };
+        const icon = iconMap[name] || '🔧';
+        const labelMap: Record<string, string> = { web_search: '联网搜索', memory_add: '保存记忆', memory_read: '读取记忆', memory_replace: '更新记忆', memory_remove: '删除记忆', read_url: '读取网页', feishu_doc_create: '创建飞书文档' };
+        if (tc._skipped) {
+          toolLines.push(`${icon} ${labelMap[name] || name}: 已取消`);
+        } else {
+          toolLines.push(`${icon} ${labelMap[name] || name}: ${JSON.stringify(args).slice(0, 100)}`);
+        }
+      }
+      // 使用注册中心执行工具调用（飞书不传 sendEvent → 自动批准）
+      const { changed } = await executeToolCalls(toolCallsFromStream, msgs);
+      // 把思维链注入到 assistant 消息中
+      if (thinkingText) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === 'assistant' && msgs[i].tool_calls && !msgs[i].thinking) {
+            msgs[i] = { ...msgs[i], thinking: thinkingText };
+          } else if (msgs[i].role === 'system') {
+            break;
+          }
+        }
+      }
+      if (!changed) break;
+      // 如果本轮既有回复又有 tool call，工具执行完就退出
+      if (replyText) break;
     } else {
-      if (!answerStarted) {
-        answerStarted = true;
-        console.log(`[飞书] → 推理完成 ${thinkingText.length} 字，开始显示回答`);
+      // 没有 tool call，回复完成
+      if (replyText) {
+        totalReplyText = replyText;
       }
-      replyText += chunk;
-      if (streamOk) {
-        pendingUpdate = sanitizeForFeishu(replyText);
-        scheduleUpdate();
-      }
+      break;
     }
   }
 
-  // 最终刷新
-  await flushUpdate();
+  if (!totalReplyText) {
+    if (toolLines.length > 0) totalReplyText = toolLines.join('\n');
+    else return;
+  }
+  // 工具调用摘要放在回复最前面
+  if (toolLines.length > 0) totalReplyText = toolLines.join('\n') + '\n\n' + totalReplyText;
+  console.log(`[飞书] → 回复 ${totalReplyText.length} 字`);
 
-  if (!replyText) return;
-  console.log(`[飞书] → 回复 ${replyText.length} 字${thinkingText ? `，推理 ${thinkingText.length} 字` : ''}`);
+  // 保存到统一会话 + 独立会话文件
+  try {
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+    const userText = lastUserMsg?.content || '';
+    saveUnifiedSession('feishu', userText, totalReplyText, config.ollama.model);
+    // 独立会话文件
+    const sid = getChatSession('feishu:' + chatId) || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+    setChatSession('feishu:' + chatId, sid);
+    const sessMessages: SessionMessage[] = [
+      { role: 'user', content: userText.slice(0, 10000) },
+      { role: 'assistant', content: totalReplyText.slice(0, 10000) },
+    ];
+    saveSession(sid, undefined, sessMessages, config.ollama.model);
+  } catch (err) { console.error('[飞书] 会话保存失败:', err); }
 
-  if (_broadcast) _broadcast({ type: 'feishu_assistant', content: replyText });
+  // 发卡片回复
+  try {
+    await replyCard(chatId, 'chat_id', totalReplyText);
+  } catch (err: any) {
+    console.error('[飞书] 卡片发送失败，降级文本:', err?.message || err);
+    await replyMessage(chatId, 'chat_id', totalReplyText);
+  }
+
+  if (_broadcast) _broadcast({ type: 'feishu_assistant', content: totalReplyText });
 }
 
 // ─── 处理收到的消息 ──────────────────────────────────────────────
@@ -404,7 +585,11 @@ async function handleImMessage(data: any) {
   const senderType = data?.sender?.sender_type;
   if (senderType === 'app') return;
 
+  // 捕获用户 open_id（用于文档创建授权）
+  _lastSenderOpenId = data?.sender?.sender_id?.open_id || null;
+
   const chatId: string = msg.chat_id || '';
+  if (chatId) feishuChats.add(chatId);
 
   if (msgType === 'text') {
     let text = '';
@@ -416,19 +601,123 @@ async function handleImMessage(data: any) {
     }
     if (!text.trim()) return;
 
+    // ─── /new /reset 重置会话 ───────────────────────────
+    if (/^\/(new|reset)\s*$/i.test(text.trim())) {
+      clearChatSession('feishu:' + chatId);
+      await replyMessage(chatId, 'chat_id', 'Small Hermes:新会话开始!');
+      return;
+    }
+
+    // 检查是否是等待确认的回复
+    const pendingApprovalId = chatApprovalMap.get(chatId);
+    if (pendingApprovalId) {
+      const t = text.trim();
+      const opt1 = /^(1|不允许|❌|否|拒绝|不|no|n|取消|✗|✘)$/i.test(t);
+      const opt2 = /^(2|允许|✅|是|可以|行|好|yes|ok|y|确认|同意|✓|✔)$/i.test(t);
+      const opt3 = /^(3|一直允许|始终|永远|总是)$/i.test(t);
+      if (opt1 || opt2 || opt3) {
+        chatApprovalMap.delete(chatId);
+        const approved = opt2 || opt3;
+        if (opt3) {
+          try { addMemory('memory', '用户允许联网搜索无需确认'); } catch {}
+        }
+        resolveApproval(pendingApprovalId, approved);
+        console.log(`[飞书] 文本确认: approval=${pendingApprovalId} approved=${approved}`);
+        const msg = opt1 ? '❌ 已取消搜索' : opt3 ? '✅ 已设为一直允许，以后联网搜索不再询问' : '✅ 已允许，开始搜索…';
+        await replyMessage(chatId, 'chat_id', msg);
+        return;
+      }
+      // 不是确认回复，继续正常处理
+    }
+
     // 推送到网页端
     if (_broadcast) _broadcast({ type: 'feishu_user', content: text });
 
     // 串行处理
     await processInOrder(chatId, async () => {
       console.log(`[飞书] ← ${text.slice(0, 50)}`);
-      await replyMessage(chatId, 'chat_id', '🤔 正在思考…');
       try {
-        const hasTools = config.tavily.apiKey ? TOOLS : undefined;
+        const hasTools = TOOLS.length > 0 ? TOOLS : undefined;
+
+        // ─── 取名检测 ────
+        const nameRegex = /(?:给你(?:取|换|改)(?:个?名字|个?名)|你叫|叫你|名字叫|名字是|你(?:以后|就)?叫|改名为|给你改名叫|取名为|取名叫|改名叫|给你起(?:名|个名))[：:]?\s*([^\s，。！？,.!?吧了哈哦嗯啊的]{2,8})/;
+        const nameMatch = text.match(nameRegex);
+        if (nameMatch) {
+          const name = nameMatch[1].trim();
+          if (name && !/什么|啥|谁|哪里|怎么|干嘛|哪个/.test(name)) {
+            const { getAssistantName, setAssistantName } = await import('./memory.js');
+            const oldName = getAssistantName();
+            setAssistantName(name);
+            console.log(`[飞书] 🏷️ 改名: "${oldName}" → "${name}"`);
+          }
+        }
+
         const messages: ChatMessage[] = [
           { role: 'system', content: getSystemPrompt() },
           { role: 'user', content: text },
         ];
+
+        // 自动检测 URL 并注入内容
+        const urlRegex = /https?:\/\/[^\s<>"']+/g;
+        const urls = text.match(urlRegex);
+        if (urls && urls.length > 0) {
+          for (const url of urls) {
+            console.log(`[飞书] 检测到 URL: ${url}`);
+            try {
+              const fetchRes = await fetch(url, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+                signal: AbortSignal.timeout(15000),
+              });
+              if (fetchRes.ok) {
+                const html = await fetchRes.text();
+                let pageText = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+                pageText = pageText.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+                pageText = pageText.replace(/<[^>]+>/g, ' ');
+                pageText = pageText.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+                pageText = pageText.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+                pageText = pageText.replace(/\s+/g, ' ').trim();
+                if (pageText.length > 10000) pageText = pageText.slice(0, 10000) + '\n\n…（内容较长，已截断）';
+                // 注入到 system prompt 后面
+                if (pageText) {
+                  messages.splice(1, 0, {
+                    role: 'system',
+                    content: `用户消息中包含链接 ${url}，以下是该网页的文本内容（共 ${pageText.length} 字）：\n${pageText}`,
+                  });
+                  console.log(`[飞书] URL 内容已注入: ${pageText.length} 字`);
+                }
+              } else {
+                messages.splice(1, 0, {
+                  role: 'system',
+                  content: `用户消息中包含链接 ${url}，但读取失败（HTTP ${fetchRes.status}）。`,
+                });
+              }
+            } catch (err: any) {
+              console.log(`[飞书] URL 读取异常: ${err.message}`);
+              messages.splice(1, 0, {
+                role: 'system',
+                content: `用户消息中包含链接 ${url}，但读取失败（${err.message}）。`,
+              });
+            }
+          }
+        }
+
+        // ─── 上下文压缩检测 ─────────────────────────────────
+        if (shouldCompress(messages)) {
+          const sid = getChatSession('feishu:' + chatId) || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+          setChatSession('feishu:' + chatId, sid);
+          const prevCount = getCompressCount(sid);
+          const newCount = prevCount + 1;
+          incrementCompressCount(sid);
+          const notifyMsg = newCount >= 5
+            ? `🧹 上下文已压缩（第 ${newCount} 轮），建议输入 /new 重启会话`
+            : `🧹 上下文已压缩（第 ${newCount} 轮）`;
+          await replyMessage(chatId, 'chat_id', notifyMsg);
+          messages.splice(0, messages.length, ...await compressMessages(messages));
+        }
+
         await doStreamAndReply(chatId, messages, hasTools);
       } catch (err) {
         console.error('[飞书] 模型调用失败:', err);
@@ -443,7 +732,6 @@ async function handleImMessage(data: any) {
 
     await processInOrder(chatId, async () => {
       console.log(`[飞书] ← 图片消息`);
-      await replyMessage(chatId, 'chat_id', '🤔 正在分析图片…');
 
       try {
         // 飞书 WS 事件 msg.content 是 JSON 字符串 {"image_key":"..."}
@@ -466,7 +754,7 @@ async function handleImMessage(data: any) {
           return;
         }
 
-        const hasTools = config.tavily.apiKey ? TOOLS : undefined;
+        const hasTools = TOOLS.length > 0 ? TOOLS : undefined;
         const messages: ChatMessage[] = [
           { role: 'system', content: getSystemPrompt() },
           { role: 'user', content: '分析这张图片的内容', images: [`data:image/${imageData.mime};base64,${imageData.base64}`] },
@@ -485,7 +773,6 @@ async function handleImMessage(data: any) {
 
     await processInOrder(chatId, async () => {
       console.log(`[飞书] ← 文件消息`);
-      await replyMessage(chatId, 'chat_id', '🤔 正在处理文件…');
 
       try {
         // 飞书 WS 事件 msg.content 是 JSON 字符串 {"file_key":"...","file_name":"..."}
@@ -526,7 +813,7 @@ async function handleImMessage(data: any) {
           userContent = `📁 用户上传了文件${fileName ? `「${fileName}」` : ''}。请直接阅读以下文件内容，然后自动回复（总结、回答相关问题、提取信息等）。无需询问用户需求。\n\n${contentPreview}`;
         }
 
-        const hasTools = config.tavily.apiKey ? TOOLS : undefined;
+        const hasTools = TOOLS.length > 0 ? TOOLS : undefined;
         const messages: ChatMessage[] = [
           { role: 'system', content: getSystemPrompt() },
           { role: 'user', content: userContent, images: fileImages },
@@ -557,6 +844,18 @@ export function startFeishuPolling() {
     'im.message.receive_v1': async (data: any) => {
       await handleImMessage(data);
     },
+    'card.action.trigger': async (data: any) => {
+      try {
+        const value = JSON.parse(data?.action?.value || '{}');
+        const { approval_id, approved } = value;
+        if (approval_id) {
+          resolveApproval(approval_id, approved === true);
+          console.log(`[飞书] 卡片按钮: approval=${approval_id} approved=${approved}`);
+        }
+      } catch (err: any) {
+        console.error('[飞书] 卡片操作解析失败:', err?.message || err);
+      }
+    },
   });
 
   wsClient.start({
@@ -564,4 +863,161 @@ export function startFeishuPolling() {
   });
 
   console.log('[飞书] 长连接已启动');
+}
+
+// ─── 云文档创建 ──────────────────────────────────────────────
+
+/** 将 Markdown 文本转换为飞书文档块 */
+function mdToBlocks(md: string): any[] {
+  const blocks: any[] = [];
+  const lines = md.split('\n');
+  let inCodeBlock = false;
+  let codeContent = '';
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      if (inCodeBlock) {
+        if (codeContent.trim()) {
+          blocks.push({
+            block_type: 18,
+            code: {
+              elements: [{ text_run: { content: codeContent, text_element_style: {} } }],
+              style: { language: 1 },
+            },
+          });
+        }
+        codeContent = '';
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeContent += (codeContent ? '\n' : '') + line;
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (/^#{1,3}\s/.test(trimmed)) {
+      const level = trimmed.match(/^(#{1,3})/)![1].length;
+      const text = trimmed.replace(/^#{1,3}\s/, '');
+      const fieldName = level === 1 ? 'heading1' : level === 2 ? 'heading2' : 'heading3';
+      blocks.push({
+        block_type: level + 2,
+        [fieldName]: {
+          elements: [{ text_run: { content: text, text_element_style: {} } }],
+          style: {},
+        },
+      });
+      continue;
+    }
+
+    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      blocks.push({
+        block_type: 12,
+        bullet: {
+          elements: [{ text_run: { content: trimmed.slice(2), text_element_style: {} } }],
+          style: {},
+        },
+      });
+      continue;
+    }
+
+    if (trimmed === '---' || trimmed === '***' || trimmed === '___') {
+      blocks.push({ block_type: 22, divider: {} });
+      continue;
+    }
+
+    blocks.push({
+      block_type: 2,
+      text: {
+        elements: [{ text_run: { content: trimmed, text_element_style: {} } }],
+        style: {},
+      },
+    });
+  }
+
+  return blocks;
+}
+
+/** 创建飞书云文档 */
+export async function createFeishuDoc(title: string, content: string, openId?: string): Promise<{ ok: boolean; url?: string; error?: string }> {
+  const t0 = Date.now();
+  try {
+    if (!config.feishu.appId || !config.feishu.appSecret) {
+      return { ok: false, error: '飞书未配置（缺少 appId/appSecret）。请在 .env 中设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET' };
+    }
+
+    // 1. 创建文档
+    console.log(`[飞书文档] 创建: ${title}`);
+    const createRes: any = await client.request({
+      method: 'POST',
+      url: '/open-apis/docx/v1/documents',
+      data: { title },
+    });
+    if (createRes.code !== 0) {
+      return { ok: false, error: `创建文档失败: ${createRes.msg || JSON.stringify(createRes)}` };
+    }
+    const docId: string = createRes.data.document.document_id;
+    const docUrl = `https://bytedance.feishu.cn/docx/${docId}`;
+
+    // 2. 转换内容为块
+    const blocks = mdToBlocks(content);
+    if (blocks.length === 0) {
+      blocks.push({
+        block_type: 2,
+        text: { elements: [{ text_run: { content: content.slice(0, 5000), text_element_style: {} } }], style: {} },
+      });
+    }
+
+    // 3. 批量添加块
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
+      const batch = blocks.slice(i, i + BATCH_SIZE);
+      const addRes: any = await client.request({
+        method: 'POST',
+        url: `/open-apis/docx/v1/documents/${docId}/blocks/${docId}/children`,
+        data: { children: batch, index: -1 },
+      });
+      if (addRes.code !== 0) {
+        console.error(`[飞书文档] 添加块失败:`, JSON.stringify(addRes));
+        return { ok: false, error: `添加内容失败: ${addRes.msg || JSON.stringify(addRes)}` };
+      }
+      if (i + BATCH_SIZE < blocks.length) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+
+    // 4. 如果有用户 open_id，分享文档给该用户
+    if (openId) {
+      try {
+        const shareRes: any = await client.request({
+          method: 'POST',
+          url: `/open-apis/drive/v1/permissions/${docId}/members`,
+          data: {
+            member_type: 'openid',
+            member_id: openId,
+            perm: 'full_access',
+          },
+        });
+        if (shareRes.code !== 0) {
+          console.error(`[飞书文档] 分享失败:`, JSON.stringify(shareRes));
+          // 不阻断——文档已创建，只是没分享成功
+        } else {
+          console.log(`[飞书文档] 已分享给用户: ${openId}`);
+        }
+      } catch (err: any) {
+        console.error(`[飞书文档] 分享异常:`, err.message);
+      }
+    }
+
+    console.log(`[飞书文档] 完成: ${docUrl} (${Date.now() - t0}ms, ${blocks.length} blocks)`);
+    return { ok: true, url: docUrl };
+  } catch (err: any) {
+    console.error('[飞书文档] 异常:', err);
+    return { ok: false, error: err.message || '未知错误' };
+  }
 }
